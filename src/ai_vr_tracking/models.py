@@ -43,6 +43,7 @@ class TrackingConfig:
     output_fps: float = 20.0
     model_complexity: int = 1
     max_cameras_to_scan: int = 5
+    pose_model_path: str = "models/pose_landmarker_full.task"
 
     @classmethod
     def from_dict(cls, payload: Dict[str, Any]) -> "TrackingConfig":
@@ -54,6 +55,7 @@ class TrackingConfig:
             output_fps=float(payload.get("output_fps", 20.0)),
             model_complexity=int(payload.get("model_complexity", 1)),
             max_cameras_to_scan=int(payload.get("max_cameras_to_scan", 5)),
+            pose_model_path=str(payload.get("pose_model_path", "models/pose_landmarker_full.task")),
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -64,6 +66,7 @@ class TrackingConfig:
             "output_fps": self.output_fps,
             "model_complexity": self.model_complexity,
             "max_cameras_to_scan": self.max_cameras_to_scan,
+            "pose_model_path": self.pose_model_path,
         }
 
 

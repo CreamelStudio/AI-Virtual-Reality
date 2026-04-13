@@ -39,6 +39,13 @@ pip install -r requirements.txt
 python3 run.py
 ```
 
+On Windows, both of these setups are supported:
+
+- Python 3.12 with the classic `mediapipe.solutions.pose` backend
+- Python 3.14 with the newer MediaPipe Tasks backend and a local model file at `models/pose_landmarker_full.task`
+
+If you use Python 3.14, download the Pose Landmarker task model and keep it at the configured path shown in the GUI.
+
 ## Usage flow
 
 1. Press `Rescan Cameras`.

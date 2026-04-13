@@ -80,6 +80,7 @@ class TrackingGuiApp(tk.Tk):
         self.host_var = tk.StringVar(value=self.config_model.output.host)
         self.port_var = tk.StringVar(value=str(self.config_model.output.port))
         self.emit_joints_var = tk.BooleanVar(value=self.config_model.output.emit_joints)
+        self.pose_model_path_var = tk.StringVar(value=self.config_model.tracking.pose_model_path)
 
         self.status_var = tk.StringVar(value="Ready")
         self.runtime_var = tk.StringVar(value="Press Start Tracking when cameras are configured.")
@@ -137,6 +138,9 @@ class TrackingGuiApp(tk.Tk):
             to=0.9,
             orient="horizontal",
         ).grid(row=2, column=1, sticky="ew", pady=(10, 0))
+
+        ttk.Label(tracking_box, text="Pose model").grid(row=3, column=0, sticky="w", pady=(10, 0))
+        ttk.Entry(tracking_box, textvariable=self.pose_model_path_var).grid(row=3, column=1, sticky="ew", pady=(10, 0))
 
         output_box = ttk.LabelFrame(controls, text="Output Bridge", padding=14)
         output_box.grid(row=1, column=0, sticky="ew", pady=(14, 0))
@@ -254,6 +258,7 @@ class TrackingGuiApp(tk.Tk):
             output_fps=self.config_model.tracking.output_fps,
             model_complexity=self.config_model.tracking.model_complexity,
             max_cameras_to_scan=self.config_model.tracking.max_cameras_to_scan,
+            pose_model_path=self.pose_model_path_var.get().strip() or "models/pose_landmarker_full.task",
         )
         output = OutputConfig(
             enabled=self.output_enabled_var.get(),
@@ -266,19 +271,25 @@ class TrackingGuiApp(tk.Tk):
         return AppConfig(tracking=tracking, output=output, cameras=cameras)
 
     def _start_tracking(self) -> None:
-        missing = detect_missing_runtime_dependencies()
-        if missing:
-            messagebox.showerror(
-                "Missing dependencies",
-                "Install required packages first:\n\npip install -r requirements.txt\n\nMissing: "
-                + ", ".join(missing),
-            )
-            return
-
         try:
             config = self._collect_config()
         except ValueError:
             messagebox.showerror("Invalid configuration", "Port and numeric settings must be valid numbers.")
+            return
+
+        missing = detect_missing_runtime_dependencies(config)
+        if missing:
+            help_text = (
+                "Tracking runtime is not ready.\n\n"
+                "For MediaPipe Tasks on Python 3.14, put a pose landmarker model at the configured path above.\n"
+                "Default: models/pose_landmarker_full.task\n\n"
+                "If you want to keep using the older MediaPipe Solutions backend instead, use Python 3.12 x64.\n\n"
+                "Details: "
+            )
+            messagebox.showerror(
+                "Tracking runtime not ready",
+                help_text + ", ".join(missing),
+            )
             return
 
         if not any(camera.enabled for camera in config.cameras):

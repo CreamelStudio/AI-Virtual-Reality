@@ -1,0 +1,31 @@
+{
+  "tracking": {
+    "mode": "upper_body",
+    "min_visibility": 0.5389423076923077,
+    "smoothing": 0.45,
+    "output_fps": 20.0,
+    "model_complexity": 1,
+    "max_cameras_to_scan": 5
+  },
+  "output": {
+    "enabled": true,
+    "protocol": "osc",
+    "host": "127.0.0.1",
+    "port": 9000,
+    "emit_joints": true
+  },
+  "cameras": [
+    {
+      "camera_index": 0,
+      "enabled": true,
+      "weight": 1.0,
+      "mirror": true
+    },
+    {
+      "camera_index": 1,
+      "enabled": false,
+      "weight": 1.0,
+      "mirror": true
+    }
+  ]
+}

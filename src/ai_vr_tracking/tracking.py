@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import threading
 import time
+import sys
+from pathlib import Path
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterable, List, Tuple
 
@@ -19,7 +21,16 @@ from .models import (
 from .output import TrackingOutputRouter
 
 
-def detect_missing_runtime_dependencies() -> List[str]:
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_POSE_MODEL_CANDIDATES = (
+    Path("models/pose_landmarker_full.task"),
+    Path("models/pose_landmarker_heavy.task"),
+    Path("models/pose_landmarker.task"),
+    Path("pose_landmarker.task"),
+)
+
+
+def detect_missing_runtime_dependencies(config: AppConfig | None = None) -> List[str]:
     missing = []
     for module_name, package_name in (
         ("cv2", "opencv-python"),
@@ -31,7 +42,47 @@ def detect_missing_runtime_dependencies() -> List[str]:
             __import__(module_name)
         except ImportError:
             missing.append(package_name)
+    if "mediapipe" not in missing:
+        try:
+            _get_pose_backend(config)
+        except RuntimeError as error:
+            missing.append(str(error))
     return missing
+
+
+def _open_video_capture(camera_index: int) -> Any:
+    import cv2
+
+    if sys.platform.startswith("win"):
+        return cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
+    return cv2.VideoCapture(camera_index)
+
+
+def _resolve_model_candidate(path_text: str) -> Path:
+    path = Path(path_text)
+    if path.is_absolute():
+        return path
+    return PROJECT_ROOT / path
+
+
+def _find_pose_model_path(config: AppConfig | None = None) -> Path | None:
+    candidates: List[Path] = []
+    if config is not None:
+        configured = config.tracking.pose_model_path.strip()
+        if configured:
+            candidates.append(_resolve_model_candidate(configured))
+
+    candidates.extend(PROJECT_ROOT / candidate for candidate in DEFAULT_POSE_MODEL_CANDIDATES)
+
+    seen: set[Path] = set()
+    for candidate in candidates:
+        normalized = candidate.resolve(strict=False)
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        if candidate.exists() and candidate.is_file():
+            return candidate
+    return None
 
 
 def list_available_cameras(max_index: int = 5) -> List[int]:
@@ -42,7 +93,7 @@ def list_available_cameras(max_index: int = 5) -> List[int]:
 
     cameras: List[int] = []
     for index in range(max_index + 1):
-        capture = cv2.VideoCapture(index)
+        capture = _open_video_capture(index)
         try:
             if not capture.isOpened():
                 continue
@@ -225,14 +276,74 @@ def _render_fused_preview(frame: FusedFrame | None, note: str) -> Any | None:
     return canvas
 
 
+def _get_pose_backend(config: AppConfig | None = None) -> Dict[str, Any]:
+    import mediapipe as mp
+
+    solutions = getattr(mp, "solutions", None)
+    pose_module = getattr(solutions, "pose", None) if solutions is not None else None
+    if pose_module is not None:
+        return {"kind": "solutions", "mp": mp, "pose_module": pose_module}
+
+    tasks = getattr(mp, "tasks", None)
+    vision = getattr(tasks, "vision", None) if tasks is not None else None
+    pose_landmarker = getattr(vision, "PoseLandmarker", None) if vision is not None else None
+    pose_options = getattr(vision, "PoseLandmarkerOptions", None) if vision is not None else None
+    running_mode = getattr(vision, "RunningMode", None) if vision is not None else None
+    base_options = getattr(tasks, "BaseOptions", None) if tasks is not None else None
+
+    if all(item is not None for item in (pose_landmarker, pose_options, running_mode, base_options)):
+        model_path = _find_pose_model_path(config)
+        if model_path is None:
+            configured = config.tracking.pose_model_path if config is not None else "models/pose_landmarker_full.task"
+            raise RuntimeError(
+                "MediaPipe Tasks is available, but no pose model file was found. "
+                f"Put `pose_landmarker_full.task` at `{configured}` or update `tracking.pose_model_path` in config.json."
+            )
+        return {
+            "kind": "tasks",
+            "mp": mp,
+            "pose_landmarker": pose_landmarker,
+            "pose_options": pose_options,
+            "running_mode": running_mode,
+            "base_options": base_options,
+            "model_path": str(model_path),
+        }
+
+    version = getattr(mp, "__version__", "unknown")
+    raise RuntimeError(
+        "Incompatible mediapipe install detected "
+        f"(version {version}). Neither `mediapipe.solutions.pose` nor `mediapipe.tasks.vision.PoseLandmarker` "
+        "is available in the current environment."
+    )
+
+
+def _draw_pose_preview(preview: Any, joints: Dict[str, JointSample]) -> None:
+    import cv2
+
+    if not joints:
+        return
+
+    height, width = preview.shape[:2]
+
+    def project(sample: JointSample) -> Tuple[int, int]:
+        return int(sample.x * width), int(sample.y * height)
+
+    active_joints = set(joints)
+    for start, end in POSE_CONNECTIONS:
+        if start not in active_joints or end not in active_joints:
+            continue
+        cv2.line(preview, project(joints[start]), project(joints[end]), (93, 110, 140), 2)
+
+    for joint in joints.values():
+        cv2.circle(preview, project(joint), max(2, int(3 + (joint.visibility * 2))), (221, 227, 236), -1)
+
+
 @dataclass
 class _CameraRuntime:
     config: CameraConfig
     capture: Any
     pose: Any
-    draw_utils: Any
-    draw_styles: Any
-    pose_connections: Any
+    backend_kind: str
 
     def read(self) -> Tuple[PoseObservation | None, Any | None]:
         import cv2
@@ -244,19 +355,22 @@ class _CameraRuntime:
         if self.config.mirror:
             frame = cv2.flip(frame, 1)
 
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        results = self.pose.process(rgb_frame)
         preview = frame.copy()
+        if self.backend_kind == "solutions":
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            results = self.pose.process(rgb_frame)
+            observation = _legacy_results_to_observation(results, self.config)
+        else:
+            import mediapipe as mp
 
-        if results.pose_landmarks is not None:
-            self.draw_utils.draw_landmarks(
-                preview,
-                results.pose_landmarks,
-                self.pose_connections,
-                landmark_drawing_spec=self.draw_styles.get_default_pose_landmarks_style(),
-            )
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
+            results = self.pose.detect_for_video(mp_image, int(time.perf_counter() * 1000))
+            observation = _task_results_to_observation(results, self.config)
 
-        observation = _results_to_observation(results, self.config)
+        if observation is not None:
+            _draw_pose_preview(preview, observation.joints)
+
         label = f"Cam {self.config.camera_index} {'OK' if observation else 'No pose'}"
         color = (80, 220, 140) if observation else (120, 130, 150)
         cv2.putText(preview, label, (12, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
@@ -267,21 +381,26 @@ class _CameraRuntime:
         self.pose.close()
 
 
-def _results_to_observation(results: Any, config: CameraConfig) -> PoseObservation | None:
-    if results.pose_landmarks is None:
+def _landmarks_to_observation(
+    config: CameraConfig,
+    normalized_landmarks: List[Any],
+    world_landmarks: List[Any] | None = None,
+) -> PoseObservation | None:
+    if not normalized_landmarks:
         return None
 
-    landmark_source = results.pose_world_landmarks or results.pose_landmarks
+    world_landmarks = world_landmarks or []
     joints: Dict[str, JointSample] = {}
     visibilities = []
-    for name, landmark in zip(LANDMARK_NAMES, landmark_source.landmark):
-        visibility = float(getattr(landmark, "visibility", 1.0))
+    for index, (name, landmark) in enumerate(zip(LANDMARK_NAMES, normalized_landmarks)):
+        world_landmark = world_landmarks[index] if index < len(world_landmarks) else None
+        visibility = float(getattr(landmark, "visibility", getattr(world_landmark, "visibility", 1.0)))
         visibilities.append(visibility)
         joints[name] = JointSample(
             name=name,
             x=float(landmark.x),
             y=float(landmark.y),
-            z=float(landmark.z),
+            z=float(getattr(world_landmark, "z", landmark.z)),
             visibility=visibility,
         )
 
@@ -292,6 +411,26 @@ def _results_to_observation(results: Any, config: CameraConfig) -> PoseObservati
         joints=joints,
         score=score,
     )
+
+
+def _legacy_results_to_observation(results: Any, config: CameraConfig) -> PoseObservation | None:
+    if results.pose_landmarks is None:
+        return None
+
+    normalized_landmarks = list(results.pose_landmarks.landmark)
+    world_landmarks = list(results.pose_world_landmarks.landmark) if results.pose_world_landmarks is not None else []
+    return _landmarks_to_observation(config, normalized_landmarks, world_landmarks)
+
+
+def _task_results_to_observation(results: Any, config: CameraConfig) -> PoseObservation | None:
+    pose_landmarks = getattr(results, "pose_landmarks", None) or []
+    if not pose_landmarks:
+        return None
+
+    normalized_landmarks = list(pose_landmarks[0])
+    world_sets = getattr(results, "pose_world_landmarks", None) or []
+    world_landmarks = list(world_sets[0]) if world_sets else []
+    return _landmarks_to_observation(config, normalized_landmarks, world_landmarks)
 
 
 def _fuse_observations(
@@ -362,41 +501,53 @@ class TrackingEngine:
 
     def _build_camera_runtimes(self) -> List[_CameraRuntime]:
         import cv2
-        import mediapipe as mp
+
+        backend = _get_pose_backend(self._config)
 
         active_cameras = [camera for camera in self._config.cameras if camera.enabled]
         runtimes: List[_CameraRuntime] = []
 
         for camera in active_cameras:
-            capture = cv2.VideoCapture(camera.camera_index)
+            capture = _open_video_capture(camera.camera_index)
             capture.set(cv2.CAP_PROP_FRAME_WIDTH, 960)
             capture.set(cv2.CAP_PROP_FRAME_HEIGHT, 540)
             if not capture.isOpened():
                 capture.release()
                 continue
 
-            pose = mp.solutions.pose.Pose(
-                static_image_mode=False,
-                model_complexity=self._config.tracking.model_complexity,
-                smooth_landmarks=True,
-                enable_segmentation=False,
-                min_detection_confidence=max(0.3, self._config.tracking.min_visibility - 0.1),
-                min_tracking_confidence=max(0.3, self._config.tracking.min_visibility - 0.1),
-            )
+            if backend["kind"] == "solutions":
+                pose = backend["pose_module"].Pose(
+                    static_image_mode=False,
+                    model_complexity=self._config.tracking.model_complexity,
+                    smooth_landmarks=True,
+                    enable_segmentation=False,
+                    min_detection_confidence=max(0.3, self._config.tracking.min_visibility - 0.1),
+                    min_tracking_confidence=max(0.3, self._config.tracking.min_visibility - 0.1),
+                )
+            else:
+                pose = backend["pose_landmarker"].create_from_options(
+                    backend["pose_options"](
+                        base_options=backend["base_options"](model_asset_path=backend["model_path"]),
+                        running_mode=backend["running_mode"].VIDEO,
+                        num_poses=1,
+                        min_pose_detection_confidence=max(0.3, self._config.tracking.min_visibility - 0.1),
+                        min_pose_presence_confidence=max(0.3, self._config.tracking.min_visibility - 0.1),
+                        min_tracking_confidence=max(0.3, self._config.tracking.min_visibility - 0.1),
+                        output_segmentation_masks=False,
+                    )
+                )
             runtimes.append(
                 _CameraRuntime(
                     config=camera,
                     capture=capture,
                     pose=pose,
-                    draw_utils=mp.solutions.drawing_utils,
-                    draw_styles=mp.solutions.drawing_styles,
-                    pose_connections=mp.solutions.pose.POSE_CONNECTIONS,
+                    backend_kind=backend["kind"],
                 )
             )
         return runtimes
 
     def _run(self) -> None:
-        missing = detect_missing_runtime_dependencies()
+        missing = detect_missing_runtime_dependencies(self._config)
         if missing:
             self._emit_update(TrackingUpdate(note=f"Missing dependencies: {', '.join(missing)}"))
             return
