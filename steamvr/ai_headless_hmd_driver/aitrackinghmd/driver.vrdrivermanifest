@@ -1,0 +1,10 @@
+{
+  "alwaysActivate": true,
+  "name": "aitrackinghmd",
+  "directory": "",
+  "resourceOnly": false,
+  "hmd_presence": [
+    "*.*"
+  ]
+}
+
