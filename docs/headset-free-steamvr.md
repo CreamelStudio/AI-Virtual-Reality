@@ -28,11 +28,7 @@ That gives SteamVR both:
 
 - left hand -> VMT controller index `20`
 - right hand -> VMT controller index `21`
-- pinch (`thumb` to `index`) -> trigger
 - close hand (`index` to `pinky` span shrinks) -> grip
-- move wrist relative to shoulder -> joystick
-- raised pinch -> `A`
-- raised grip -> `B`
 
 If the hand landmarks are noisy for a specific game, start the bridge with `--disable-controllers` and use keyboard or gamepad remapping instead.
 

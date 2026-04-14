@@ -73,7 +73,7 @@ class AiTrackingHmdDeviceDriver : public vr::ITrackedDeviceServerDriver
 {
 public:
     AiTrackingHmdDeviceDriver();
-    ~AiTrackingHmdDeviceDriver() override;
+    ~AiTrackingHmdDeviceDriver();
 
     vr::EVRInitError Activate( uint32_t unObjectId ) override;
     void EnterStandby() override;

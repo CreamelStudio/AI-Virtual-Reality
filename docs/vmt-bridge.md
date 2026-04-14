@@ -66,11 +66,7 @@ All devices are sent in VMT's tracker mode `7`, which is the VIVE Tracker compat
 
 - `left_controller` -> VMT index `20`, controller mode `5`
 - `right_controller` -> VMT index `21`, controller mode `6`
-- pinch (`thumb` + `index`) -> trigger
 - closed hand (`index` + `pinky` span) -> grip
-- wrist offset from shoulder -> joystick X/Y
-- raised pinch -> `A`
-- raised grip -> `B`
 
 For legacy-input games, VMT's compatible controller mode is usually the safer choice than finger-only input.
 

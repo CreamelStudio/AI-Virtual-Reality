@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import json
 import math
 import socket
@@ -13,6 +14,8 @@ from .output import _encode_osc_message
 
 
 EPSILON = 1e-6
+HMD_LOCAL_XZ_BLEND = 0.25
+HMD_LOCAL_Y_BLEND = 0.60
 
 
 @dataclass(frozen=True)
@@ -103,7 +106,9 @@ class BridgeConfig:
     scale: float = 1.0
     x_axis_scale: float = 1.0
     y_axis_scale: float = 1.0
-    z_axis_scale: float = 1.0
+    z_axis_scale: float = -1.0
+    hmd_y_offset: float = 0.0
+    controller_position_scale: float = 2.2
     waist_height: float = 0.95
     foot_floor_offset: float = 0.02
     packet_timeout: float = 1.5
@@ -137,12 +142,20 @@ class CalibrationState:
     origin: Vec3 = field(default_factory=lambda: Vec3(0.0, 0.0, 0.0))
     yaw_correction: float = 0.0
     y_offset: float = 0.95
+    hmd_origin: Vec3 | None = None
+    hmd_reference: Vec3 | None = None
+    hmd_root_origin: Vec3 | None = None
+    hmd_root_offset: Vec3 | None = None
 
     def transform(self, vector: Vec3, config: BridgeConfig) -> Vec3:
         translated = vector - self.origin
         rotated = translated.rotate_y(self.yaw_correction)
         scaled = rotated * config.scale
         return Vec3(scaled.x, scaled.y + self.y_offset, scaled.z)
+
+    def transform_delta(self, vector: Vec3, config: BridgeConfig) -> Vec3:
+        rotated = vector.rotate_y(self.yaw_correction)
+        return rotated * config.scale
 
 
 @dataclass(frozen=True)
@@ -294,18 +307,84 @@ def _torso_forward(joints: Dict[str, Vec3]) -> Vec3:
     return planar.normalized(Vec3(0.0, 0.0, 1.0))
 
 
+def _head_anchor(joints: Dict[str, Vec3], trackers: Dict[str, Vec3] | None = None) -> Vec3 | None:
+    face = _pick_center(joints, ["nose", "left_eye", "right_eye", "left_ear", "right_ear"])
+    if face is not None:
+        return face
+    if trackers is not None:
+        return trackers.get("head") or trackers.get("chest") or trackers.get("waist")
+    return None
+
+
+def _root_anchor(joints: Dict[str, Vec3], trackers: Dict[str, Vec3] | None = None) -> Vec3 | None:
+    if trackers is not None:
+        root = trackers.get("chest") or trackers.get("neck") or trackers.get("waist")
+        if root is not None:
+            return root
+    return _pick_center(joints, ["left_shoulder", "right_shoulder"]) or _pick_center(joints, ["left_hip", "right_hip"])
+
+
+def _head_forward(joints: Dict[str, Vec3]) -> Vec3:
+    if "nose" in joints:
+        reference = _pick_center(joints, ["left_ear", "right_ear"]) or _pick_center(joints, ["left_eye", "right_eye"])
+        if reference is not None:
+            face_forward = joints["nose"] - reference
+            planar = Vec3(face_forward.x, 0.0, face_forward.z)
+            if planar.length() > 0.03:
+                return planar.normalized(Vec3(0.0, 0.0, 1.0))
+    return _torso_forward(joints)
+
+
+def _derive_controller_pose(
+    joints: Dict[str, Vec3],
+    side: str,
+    fallback_pose: VmtPose | None,
+    config: BridgeConfig,
+) -> VmtPose | None:
+    shoulder = joints.get(f"{side}_shoulder")
+    elbow = joints.get(f"{side}_elbow")
+    wrist = joints.get(f"{side}_wrist")
+
+    if wrist is None:
+        return fallback_pose
+
+    torso_forward = _torso_forward(joints)
+    upper_arm = (elbow - shoulder) if elbow is not None and shoulder is not None else None
+    forearm = (wrist - elbow) if wrist is not None and elbow is not None else None
+
+    wrist_position = fallback_pose.position if fallback_pose is not None else wrist
+    grip_position = wrist_position
+    if shoulder is not None:
+        arm_vector = wrist_position - shoulder
+        if arm_vector.length() > 0.02:
+            grip_position = shoulder + (arm_vector * max(config.controller_position_scale, 0.1))
+
+    up_axis = forearm or upper_arm or Vec3(0.0, -1.0, 0.0)
+    forward_axis = upper_arm or torso_forward
+    basis = _build_basis(up=up_axis, forward=forward_axis, fallback_forward=torso_forward)
+    rotation = _quaternion_from_basis(*basis)
+    return VmtPose(position=grip_position, rotation=rotation)
+
+
 def _body_pose(joints: Dict[str, Vec3], tracker_name: str, position: Vec3) -> VmtPose:
     torso_forward = _torso_forward(joints)
     if tracker_name == "head":
         right = None
-        head = _pick_center(joints, ["nose", "left_ear", "right_ear"])
+        head = _head_anchor(joints)
         chest = _pick_center(joints, ["left_shoulder", "right_shoulder"])
         if "left_ear" in joints and "right_ear" in joints:
             right = joints["right_ear"] - joints["left_ear"]
         elif "left_shoulder" in joints and "right_shoulder" in joints:
             right = joints["right_shoulder"] - joints["left_shoulder"]
         up = (head - chest) if head is not None and chest is not None else Vec3(0.0, 1.0, 0.0)
-        basis = _build_basis(right=right or Vec3(1.0, 0.0, 0.0), up=up, fallback_forward=torso_forward)
+        face_forward = _head_forward(joints)
+        basis = _build_basis(
+            right=right or Vec3(1.0, 0.0, 0.0),
+            forward=face_forward,
+            fallback_forward=torso_forward,
+        )
+        if basis[1].length() <= EPSILON:
+            basis = _build_basis(right=right or Vec3(1.0, 0.0, 0.0), up=up, fallback_forward=torso_forward)
     elif tracker_name in {"waist", "chest", "neck"}:
         right = None
         if "left_shoulder" in joints and "right_shoulder" in joints:
@@ -319,10 +398,20 @@ def _body_pose(joints: Dict[str, Vec3], tracker_name: str, position: Vec3) -> Vm
         basis = _build_basis(right=right or Vec3(1.0, 0.0, 0.0), up=up, fallback_forward=torso_forward)
     elif tracker_name in {"left_hand", "right_hand", "left_elbow", "right_elbow"}:
         side = "left" if tracker_name.startswith("left") else "right"
+        shoulder = joints.get(f"{side}_shoulder")
         elbow = joints.get(f"{side}_elbow")
         wrist = joints.get(f"{side}_wrist")
-        forearm = (wrist - elbow) if wrist is not None and elbow is not None else Vec3(0.0, 1.0, 0.0)
-        basis = _build_basis(up=forearm, forward=torso_forward)
+        upper_arm = (elbow - shoulder) if elbow is not None and shoulder is not None else None
+        forearm = (wrist - elbow) if wrist is not None and elbow is not None else None
+
+        if tracker_name.endswith("hand"):
+            up_axis = forearm or upper_arm or Vec3(0.0, 1.0, 0.0)
+            forward_axis = upper_arm or torso_forward
+            basis = _build_basis(up=up_axis, forward=forward_axis, fallback_forward=torso_forward)
+        else:
+            up_axis = upper_arm or forearm or Vec3(0.0, 1.0, 0.0)
+            forward_axis = forearm or torso_forward
+            basis = _build_basis(up=up_axis, forward=forward_axis, fallback_forward=torso_forward)
     elif tracker_name in {"left_foot", "right_foot", "left_knee", "right_knee"}:
         side = "left" if tracker_name.startswith("left") else "right"
         ankle = joints.get(f"{side}_ankle")
@@ -393,6 +482,15 @@ def _calibrate(
         state.y_offset = max(config.foot_floor_offset, -min(feet) + config.foot_floor_offset)
     else:
         state.y_offset = config.waist_height
+
+    head_anchor = trackers.get("head") or trackers.get("chest") or trackers.get("waist")
+    if head_anchor is not None:
+        state.hmd_origin = head_anchor
+        state.hmd_reference = state.transform(head_anchor, config)
+    root_anchor = _root_anchor(joints, trackers)
+    if head_anchor is not None and root_anchor is not None:
+        state.hmd_root_origin = root_anchor
+        state.hmd_root_offset = state.transform_delta(head_anchor - root_anchor, config)
     state.ready = True
 
 
@@ -401,6 +499,67 @@ def _derive_vmt_poses(joints: Dict[str, Vec3], trackers: Dict[str, Vec3]) -> Dic
     for tracker_name, tracker_position in trackers.items():
         poses[tracker_name] = _body_pose(joints, tracker_name, tracker_position)
     return poses
+
+
+def _derive_head_hmd_pose(
+    calibration: CalibrationState,
+    config: BridgeConfig,
+    raw_joints: Dict[str, Vec3],
+    raw_trackers: Dict[str, Vec3],
+    transformed_joints: Dict[str, Vec3],
+    transformed_trackers: Dict[str, Vec3],
+    fallback_pose: VmtPose | None,
+) -> VmtPose | None:
+    head_anchor = _head_anchor(raw_joints, raw_trackers)
+    if head_anchor is None:
+        return fallback_pose
+    root_anchor = _root_anchor(raw_joints, raw_trackers)
+    transformed_head = _head_anchor(transformed_joints, transformed_trackers)
+
+    if calibration.hmd_origin is None or calibration.hmd_reference is None:
+        calibration.hmd_origin = head_anchor
+        calibration.hmd_reference = calibration.transform(head_anchor, config)
+    if root_anchor is not None and calibration.hmd_root_origin is None:
+        calibration.hmd_root_origin = root_anchor
+    if root_anchor is not None and calibration.hmd_root_offset is None:
+        calibration.hmd_root_offset = calibration.transform_delta(head_anchor - root_anchor, config)
+
+    position = None
+    if transformed_head is not None:
+        # Keep the HMD in the same transformed space as the body trackers first.
+        position = transformed_head
+    elif fallback_pose is not None:
+        position = fallback_pose.position
+
+    transformed_root = _root_anchor(transformed_joints, transformed_trackers)
+    if position is None and transformed_root is not None and calibration.hmd_root_offset is not None:
+        position = transformed_root + calibration.hmd_root_offset
+        if root_anchor is not None:
+            live_root_to_head = calibration.transform_delta(head_anchor - root_anchor, config)
+            local_delta = live_root_to_head - calibration.hmd_root_offset
+            position = position + Vec3(
+                local_delta.x * HMD_LOCAL_XZ_BLEND,
+                local_delta.y * HMD_LOCAL_Y_BLEND,
+                local_delta.z * HMD_LOCAL_XZ_BLEND,
+            )
+
+    if position is None:
+        delta = calibration.transform_delta(head_anchor - calibration.hmd_origin, config)
+        position = calibration.hmd_reference + delta
+
+    position = Vec3(position.x, position.y + config.hmd_y_offset, position.z)
+    chest_position = transformed_trackers.get("chest") or transformed_trackers.get("waist")
+    if chest_position is not None and position.y < (chest_position.y + 0.18):
+        position = Vec3(position.x, chest_position.y + 0.18, position.z)
+
+    if fallback_pose is not None:
+        return VmtPose(position=position, rotation=fallback_pose.rotation)
+
+    synthetic_joints = dict(transformed_joints)
+    synthetic_joints["nose"] = position
+    synthetic_joints["left_ear"] = position
+    synthetic_joints["right_ear"] = position
+    return _body_pose(synthetic_joints, "head", position)
 
 
 class VmtOscClient:
@@ -486,11 +645,7 @@ class VmtOscClient:
         )
 
     def send_controller_state(self, index: int, state: ControllerGestureState) -> None:
-        self.send_trigger(index, 0, state.trigger)
         self.send_trigger(index, 1, state.grip)
-        self.send_joystick(index, 1, state.joystick_x, state.joystick_y, clicked=state.grip > 0.85)
-        self.send_button(index, 1, state.a_pressed)
-        self.send_button(index, 3, state.b_pressed)
 
 
 class HeadlessHmdUdpClient:
@@ -525,6 +680,23 @@ def _neutral_controller_state() -> ControllerGestureState:
     return ControllerGestureState(0.0, 0.0, 0.0, 0.0, False, False)
 
 
+def _is_key_pressed(virtual_key: int) -> bool:
+    if not sys.platform.startswith("win"):
+        return False
+    return bool(ctypes.windll.user32.GetAsyncKeyState(virtual_key) & 0x8000)
+
+
+def _keyboard_joystick_state() -> tuple[float, float]:
+    left_pressed = _is_key_pressed(0x41)  # A
+    right_pressed = _is_key_pressed(0x44)  # D
+    forward_pressed = _is_key_pressed(0x57)  # W
+    back_pressed = _is_key_pressed(0x53)  # S
+
+    x_value = float(right_pressed) - float(left_pressed)
+    y_value = float(forward_pressed) - float(back_pressed)
+    return _clamp(x_value, -1.0, 1.0), _clamp(y_value, -1.0, 1.0)
+
+
 def _gesture_state_for_side(joints: Dict[str, Vec3], side: str) -> ControllerGestureState | None:
     wrist = joints.get(f"{side}_wrist")
     elbow = joints.get(f"{side}_elbow")
@@ -539,24 +711,13 @@ def _gesture_state_for_side(joints: Dict[str, Vec3], side: str) -> ControllerGes
     forearm_length = _distance(wrist, elbow) if elbow is not None else 0.25
     forearm_length = max(forearm_length, 0.18)
 
-    if thumb is not None and index is not None:
-        pinch_ratio = _distance(thumb, index) / forearm_length
-        trigger = 1.0 - _clamp((pinch_ratio - 0.05) / 0.20, 0.0, 1.0)
-    else:
-        trigger = 0.0
-
     if index is not None and pinky is not None:
         span_ratio = _distance(index, pinky) / forearm_length
         grip = 1.0 - _clamp((span_ratio - 0.08) / 0.30, 0.0, 1.0)
     else:
         grip = 0.0
 
-    joystick_x = _apply_deadzone((wrist.x - shoulder.x) / (forearm_length * 1.15))
-    joystick_y = _apply_deadzone((shoulder.z - wrist.z) / (forearm_length * 1.15))
-
-    a_pressed = trigger > 0.85 and wrist.y > (shoulder.y + (forearm_length * 0.30))
-    b_pressed = grip > 0.80 and wrist.y > (shoulder.y + (forearm_length * 0.45))
-    return ControllerGestureState(trigger, grip, joystick_x, joystick_y, a_pressed, b_pressed)
+    return ControllerGestureState(0.0, grip, 0.0, 0.0, False, False)
 
 
 class VmtBridgeRuntime:
@@ -621,7 +782,12 @@ class VmtBridgeRuntime:
         active_controllers: set[str] = set()
         if self.config.enable_controllers:
             for controller_name, binding in self.config.controller_bindings.items():
-                hand_pose = poses.get("left_hand" if binding.side == "left" else "right_hand")
+                hand_pose = _derive_controller_pose(
+                    transformed_joints,
+                    binding.side,
+                    poses.get("left_hand" if binding.side == "left" else "right_hand"),
+                    self.config,
+                )
                 gesture_state = _gesture_state_for_side(transformed_joints, binding.side)
                 if hand_pose is None or gesture_state is None:
                     continue
@@ -636,7 +802,15 @@ class VmtBridgeRuntime:
         self._enabled_controllers = active_controllers
 
         if self.hmd_client is not None:
-            head_pose = poses.get("head") or poses.get("chest") or poses.get("waist")
+            head_pose = _derive_head_hmd_pose(
+                calibration=self.calibration,
+                config=self.config,
+                raw_joints=joints,
+                raw_trackers=trackers,
+                transformed_joints=transformed_joints,
+                transformed_trackers=transformed_trackers,
+                fallback_pose=poses.get("head") or poses.get("chest") or poses.get("waist"),
+            )
             if head_pose is not None:
                 self.hmd_client.send_pose(head_pose, connected=True)
 
@@ -713,7 +887,9 @@ def _parse_args(argv: List[str]) -> BridgeConfig:
     parser.add_argument("--scale", type=float, default=1.0, help="Global position scale after calibration.")
     parser.add_argument("--x-axis-scale", type=float, default=1.0)
     parser.add_argument("--y-axis-scale", type=float, default=1.0)
-    parser.add_argument("--z-axis-scale", type=float, default=1.0)
+    parser.add_argument("--z-axis-scale", type=float, default=-1.0)
+    parser.add_argument("--hmd-y-offset", type=float, default=0.0)
+    parser.add_argument("--controller-position-scale", type=float, default=2.2)
     parser.add_argument("--waist-height", type=float, default=0.95, help="Fallback waist height in meters.")
     parser.add_argument("--foot-floor-offset", type=float, default=0.02, help="Lift feet slightly above floor.")
     parser.add_argument("--packet-timeout", type=float, default=1.5)
@@ -732,6 +908,8 @@ def _parse_args(argv: List[str]) -> BridgeConfig:
         x_axis_scale=args.x_axis_scale,
         y_axis_scale=args.y_axis_scale,
         z_axis_scale=args.z_axis_scale,
+        hmd_y_offset=args.hmd_y_offset,
+        controller_position_scale=args.controller_position_scale,
         waist_height=args.waist_height,
         foot_floor_offset=args.foot_floor_offset,
         packet_timeout=args.packet_timeout,

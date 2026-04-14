@@ -16,6 +16,12 @@ class CameraConfig:
     enabled: bool = True
     weight: float = 1.0
     mirror: bool = True
+    position_x: float = 0.0
+    position_y: float = 0.0
+    position_z: float = 0.0
+    yaw_degrees: float = 0.0
+    pitch_degrees: float = 0.0
+    roll_degrees: float = 0.0
 
     @classmethod
     def from_dict(cls, payload: Dict[str, Any]) -> "CameraConfig":
@@ -24,6 +30,12 @@ class CameraConfig:
             enabled=bool(payload.get("enabled", True)),
             weight=float(payload.get("weight", 1.0)),
             mirror=bool(payload.get("mirror", True)),
+            position_x=float(payload.get("position_x", 0.0)),
+            position_y=float(payload.get("position_y", 0.0)),
+            position_z=float(payload.get("position_z", 0.0)),
+            yaw_degrees=float(payload.get("yaw_degrees", 0.0)),
+            pitch_degrees=float(payload.get("pitch_degrees", 0.0)),
+            roll_degrees=float(payload.get("roll_degrees", 0.0)),
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -32,6 +44,12 @@ class CameraConfig:
             "enabled": self.enabled,
             "weight": self.weight,
             "mirror": self.mirror,
+            "position_x": self.position_x,
+            "position_y": self.position_y,
+            "position_z": self.position_z,
+            "yaw_degrees": self.yaw_degrees,
+            "pitch_degrees": self.pitch_degrees,
+            "roll_degrees": self.roll_degrees,
         }
 
 
@@ -77,6 +95,13 @@ class OutputConfig:
     host: str = "127.0.0.1"
     port: int = 9000
     emit_joints: bool = True
+    bridge_enable_hmd: bool = True
+    bridge_enable_controllers: bool = True
+    bridge_x_axis_scale: float = 1.0
+    bridge_y_axis_scale: float = 1.0
+    bridge_z_axis_scale: float = -1.0
+    hmd_y_offset: float = 0.0
+    controller_position_scale: float = 2.2
 
     @classmethod
     def from_dict(cls, payload: Dict[str, Any]) -> "OutputConfig":
@@ -86,6 +111,13 @@ class OutputConfig:
             host=str(payload.get("host", "127.0.0.1")),
             port=int(payload.get("port", 9000)),
             emit_joints=bool(payload.get("emit_joints", True)),
+            bridge_enable_hmd=bool(payload.get("bridge_enable_hmd", True)),
+            bridge_enable_controllers=bool(payload.get("bridge_enable_controllers", True)),
+            bridge_x_axis_scale=float(payload.get("bridge_x_axis_scale", 1.0)),
+            bridge_y_axis_scale=float(payload.get("bridge_y_axis_scale", 1.0)),
+            bridge_z_axis_scale=float(payload.get("bridge_z_axis_scale", -1.0)),
+            hmd_y_offset=float(payload.get("hmd_y_offset", 0.0)),
+            controller_position_scale=float(payload.get("controller_position_scale", 2.2)),
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -95,6 +127,13 @@ class OutputConfig:
             "host": self.host,
             "port": self.port,
             "emit_joints": self.emit_joints,
+            "bridge_enable_hmd": self.bridge_enable_hmd,
+            "bridge_enable_controllers": self.bridge_enable_controllers,
+            "bridge_x_axis_scale": self.bridge_x_axis_scale,
+            "bridge_y_axis_scale": self.bridge_y_axis_scale,
+            "bridge_z_axis_scale": self.bridge_z_axis_scale,
+            "hmd_y_offset": self.hmd_y_offset,
+            "controller_position_scale": self.controller_position_scale,
         }
 
 

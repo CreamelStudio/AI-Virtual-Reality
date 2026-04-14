@@ -3,6 +3,7 @@ from __future__ import annotations
 import threading
 import time
 import sys
+import math
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterable, List, Tuple
@@ -143,6 +144,43 @@ def _weighted_average(samples: List[Tuple[JointSample, float]]) -> Tuple[Tuple[f
     return (float(averaged[0]), float(averaged[1]), float(averaged[2])), confidence
 
 
+def _rotate_point(x_value: float, y_value: float, z_value: float, camera: CameraConfig) -> Tuple[float, float, float]:
+    yaw = math.radians(camera.yaw_degrees)
+    pitch = math.radians(camera.pitch_degrees)
+    roll = math.radians(camera.roll_degrees)
+
+    cos_yaw, sin_yaw = math.cos(yaw), math.sin(yaw)
+    cos_pitch, sin_pitch = math.cos(pitch), math.sin(pitch)
+    cos_roll, sin_roll = math.cos(roll), math.sin(roll)
+
+    x1 = (x_value * cos_yaw) + (z_value * sin_yaw)
+    y1 = y_value
+    z1 = (-x_value * sin_yaw) + (z_value * cos_yaw)
+
+    x2 = x1
+    y2 = (y1 * cos_pitch) - (z1 * sin_pitch)
+    z2 = (y1 * sin_pitch) + (z1 * cos_pitch)
+
+    x3 = (x2 * cos_roll) - (y2 * sin_roll)
+    y3 = (x2 * sin_roll) + (y2 * cos_roll)
+    z3 = z2
+    return x3, y3, z3
+
+
+def _apply_camera_transform(joints: Dict[str, JointSample], camera: CameraConfig) -> Dict[str, JointSample]:
+    transformed: Dict[str, JointSample] = {}
+    for name, joint in joints.items():
+        rotated_x, rotated_y, rotated_z = _rotate_point(joint.x, joint.y, joint.z, camera)
+        transformed[name] = JointSample(
+            name=name,
+            x=rotated_x + camera.position_x,
+            y=rotated_y + camera.position_y,
+            z=rotated_z + camera.position_z,
+            visibility=joint.visibility,
+        )
+    return transformed
+
+
 def _average_named_points(joints: Dict[str, JointSample], names: Iterable[str]) -> TrackerPose | None:
     selected = [joints[name] for name in names if name in joints]
     if not selected:
@@ -157,18 +195,31 @@ def _average_named_points(joints: Dict[str, JointSample], names: Iterable[str]) 
     )
 
 
+def _single_joint_tracker(joints: Dict[str, JointSample], name: str) -> TrackerPose | None:
+    joint = joints.get(name)
+    if joint is None:
+        return None
+    return TrackerPose(
+        name="",
+        x=joint.x,
+        y=joint.y,
+        z=joint.z,
+        confidence=joint.visibility,
+    )
+
+
 def _build_trackers(joints: Dict[str, JointSample], mode: TrackingMode) -> Dict[str, TrackerPose]:
     trackers: Dict[str, TrackerPose] = {}
 
     head = _average_named_points(joints, ["nose", "left_eye", "right_eye", "left_ear", "right_ear"])
     shoulders = _average_named_points(joints, ["left_shoulder", "right_shoulder"])
     hips = _average_named_points(joints, ["left_hip", "right_hip"])
-    left_hand = _average_named_points(joints, ["left_wrist", "left_index", "left_thumb", "left_pinky"])
-    right_hand = _average_named_points(joints, ["right_wrist", "right_index", "right_thumb", "right_pinky"])
-    left_elbow = _average_named_points(joints, ["left_elbow"])
-    right_elbow = _average_named_points(joints, ["right_elbow"])
-    left_knee = _average_named_points(joints, ["left_knee"])
-    right_knee = _average_named_points(joints, ["right_knee"])
+    left_hand = _single_joint_tracker(joints, "left_wrist")
+    right_hand = _single_joint_tracker(joints, "right_wrist")
+    left_elbow = _single_joint_tracker(joints, "left_elbow")
+    right_elbow = _single_joint_tracker(joints, "right_elbow")
+    left_knee = _single_joint_tracker(joints, "left_knee")
+    right_knee = _single_joint_tracker(joints, "right_knee")
     left_foot = _average_named_points(joints, ["left_ankle", "left_heel", "left_foot_index"])
     right_foot = _average_named_points(joints, ["right_ankle", "right_heel", "right_foot_index"])
 
@@ -338,6 +389,22 @@ def _draw_pose_preview(preview: Any, joints: Dict[str, JointSample]) -> None:
         cv2.circle(preview, project(joint), max(2, int(3 + (joint.visibility * 2))), (221, 227, 236), -1)
 
 
+def _normalized_landmarks_to_joint_map(normalized_landmarks: List[Any], world_landmarks: List[Any] | None = None) -> Dict[str, JointSample]:
+    joints: Dict[str, JointSample] = {}
+    world_landmarks = world_landmarks or []
+    for index, (name, landmark) in enumerate(zip(LANDMARK_NAMES, normalized_landmarks)):
+        world_landmark = world_landmarks[index] if index < len(world_landmarks) else None
+        visibility = float(getattr(landmark, "visibility", getattr(world_landmark, "visibility", 1.0)))
+        joints[name] = JointSample(
+            name=name,
+            x=float(landmark.x),
+            y=float(landmark.y),
+            z=float(getattr(landmark, "z", 0.0)),
+            visibility=visibility,
+        )
+    return joints
+
+
 @dataclass
 class _CameraRuntime:
     config: CameraConfig
@@ -360,6 +427,7 @@ class _CameraRuntime:
             rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             results = self.pose.process(rgb_frame)
             observation = _legacy_results_to_observation(results, self.config)
+            preview_joints = _legacy_results_to_preview_joints(results)
         else:
             import mediapipe as mp
 
@@ -367,9 +435,10 @@ class _CameraRuntime:
             mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
             results = self.pose.detect_for_video(mp_image, int(time.perf_counter() * 1000))
             observation = _task_results_to_observation(results, self.config)
+            preview_joints = _task_results_to_preview_joints(results)
 
-        if observation is not None:
-            _draw_pose_preview(preview, observation.joints)
+        if preview_joints:
+            _draw_pose_preview(preview, preview_joints)
 
         label = f"Cam {self.config.camera_index} {'OK' if observation else 'No pose'}"
         color = (80, 220, 140) if observation else (120, 130, 150)
@@ -396,13 +465,16 @@ def _landmarks_to_observation(
         world_landmark = world_landmarks[index] if index < len(world_landmarks) else None
         visibility = float(getattr(landmark, "visibility", getattr(world_landmark, "visibility", 1.0)))
         visibilities.append(visibility)
+        position_source = world_landmark or landmark
         joints[name] = JointSample(
             name=name,
-            x=float(landmark.x),
-            y=float(landmark.y),
-            z=float(getattr(world_landmark, "z", landmark.z)),
+            x=float(position_source.x),
+            y=float(position_source.y),
+            z=float(position_source.z),
             visibility=visibility,
         )
+
+    joints = _apply_camera_transform(joints, config)
 
     score = sum(visibilities) / max(len(visibilities), 1)
     return PoseObservation(
@@ -422,6 +494,14 @@ def _legacy_results_to_observation(results: Any, config: CameraConfig) -> PoseOb
     return _landmarks_to_observation(config, normalized_landmarks, world_landmarks)
 
 
+def _legacy_results_to_preview_joints(results: Any) -> Dict[str, JointSample]:
+    if results.pose_landmarks is None:
+        return {}
+    normalized_landmarks = list(results.pose_landmarks.landmark)
+    world_landmarks = list(results.pose_world_landmarks.landmark) if results.pose_world_landmarks is not None else []
+    return _normalized_landmarks_to_joint_map(normalized_landmarks, world_landmarks)
+
+
 def _task_results_to_observation(results: Any, config: CameraConfig) -> PoseObservation | None:
     pose_landmarks = getattr(results, "pose_landmarks", None) or []
     if not pose_landmarks:
@@ -431,6 +511,16 @@ def _task_results_to_observation(results: Any, config: CameraConfig) -> PoseObse
     world_sets = getattr(results, "pose_world_landmarks", None) or []
     world_landmarks = list(world_sets[0]) if world_sets else []
     return _landmarks_to_observation(config, normalized_landmarks, world_landmarks)
+
+
+def _task_results_to_preview_joints(results: Any) -> Dict[str, JointSample]:
+    pose_landmarks = getattr(results, "pose_landmarks", None) or []
+    if not pose_landmarks:
+        return {}
+    normalized_landmarks = list(pose_landmarks[0])
+    world_sets = getattr(results, "pose_world_landmarks", None) or []
+    world_landmarks = list(world_sets[0]) if world_sets else []
+    return _normalized_landmarks_to_joint_map(normalized_landmarks, world_landmarks)
 
 
 def _fuse_observations(

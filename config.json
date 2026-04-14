@@ -1,31 +1,39 @@
 {
   "tracking": {
     "mode": "upper_body",
-    "min_visibility": 0.5389423076923077,
-    "smoothing": 0.45,
+    "min_visibility": 0.5876404494382024,
+    "smoothing": 0.30526315789473685,
     "output_fps": 20.0,
     "model_complexity": 1,
-    "max_cameras_to_scan": 5
+    "max_cameras_to_scan": 5,
+    "pose_model_path": "models/pose_landmarker_heavy.task"
   },
   "output": {
     "enabled": true,
-    "protocol": "osc",
+    "protocol": "json_udp",
     "host": "127.0.0.1",
-    "port": 9000,
-    "emit_joints": true
+    "port": 7000,
+    "emit_joints": true,
+    "bridge_enable_hmd": true,
+    "bridge_enable_controllers": false,
+    "bridge_x_axis_scale": 1.0,
+    "bridge_y_axis_scale": 1.0,
+    "bridge_z_axis_scale": -1.0,
+    "hmd_y_offset": 0.0,
+    "controller_position_scale": 2.2
   },
   "cameras": [
     {
       "camera_index": 0,
       "enabled": true,
       "weight": 1.0,
-      "mirror": true
-    },
-    {
-      "camera_index": 1,
-      "enabled": false,
-      "weight": 1.0,
-      "mirror": true
+      "mirror": false,
+      "position_x": 0.993,
+      "position_y": 1.0,
+      "position_z": 2.079,
+      "yaw_degrees": 1.5,
+      "pitch_degrees": 0.0,
+      "roll_degrees": 0.0
     }
   ]
 }

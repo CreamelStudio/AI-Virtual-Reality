@@ -50,10 +50,11 @@ If you use Python 3.14, download the Pose Landmarker task model and keep it at t
 
 1. Press `Rescan Cameras`.
 2. Enable one or more webcams.
-3. Pick `full_body` or `upper_body`.
-4. Set smoothing and minimum visibility.
-5. Choose `osc` or `json_udp`.
-6. Press `Start Tracking`.
+3. If you want SteamVR headset-free mode on Windows, press `Auto Setup SteamVR` in the GUI.
+4. Pick `full_body` or `upper_body`.
+5. Set smoothing and minimum visibility.
+6. Choose `osc` or `json_udp`.
+7. Press `Start Tracking`.
 
 ## Output modes
 
